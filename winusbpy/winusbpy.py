@@ -26,7 +26,7 @@ class WinUsbPy(object):
         self.usb_winusb_guid = GUID(0xdee824ef, 0x729b, 0x4a0e, byte_array(0x9c, 0x14, 0xb7, 0x11, 0x7d, 0x33, 0xa8, 0x17))
         self.usb_composite_guid = GUID(0x36FC9E60, 0xC465, 0x11CF, byte_array(0x80, 0x56, 0x44, 0x45, 0x53, 0x54, 0x00, 0x00))
         self.handle_file = INVALID_HANDLE_VALUE
-        self.handle_winusb = c_void_p()
+        self.handle_winusb = [c_void_p()]
         self._index = -1
 
     def list_usb_devices(self, **kwargs):
@@ -103,7 +103,7 @@ class WinUsbPy(object):
 
         if self.handle_file == INVALID_HANDLE_VALUE:
             return False
-        result = self.api.exec_function_winusb(WinUsb_Initialize, self.handle_file, byref(self.handle_winusb))
+        result = self.api.exec_function_winusb(WinUsb_Initialize, self.handle_file, byref(self.handle_winusb[0]))
         if result == 0:
             err = self.get_last_error_code()
             raise ctypes.WinError()
@@ -114,7 +114,7 @@ class WinUsbPy(object):
 
     def close_winusb_device(self):
         result_file = self.api.exec_function_kernel32(Close_Handle, self.handle_file)
-        result_winusb = self.api.exec_function_winusb(WinUsb_Free, self.handle_winusb)
+        result_winusb = [self.api.exec_function_winusb(WinUsb_Free, h) for h in self.handle_winusb]
         return result_file != 0 and result_winusb != 0
 
     def get_last_error_code(self):
@@ -124,7 +124,7 @@ class WinUsbPy(object):
         info_type = c_ulong(query)
         buff = (c_void_p * 1)()
         buff_length = c_ulong(sizeof(c_void_p))
-        result = self.api.exec_function_winusb(WinUsb_QueryDeviceInformation, self.handle_winusb, info_type,
+        result = self.api.exec_function_winusb(WinUsb_QueryDeviceInformation, self.handle_winusb[self._index], info_type,
                                                byref(buff_length), buff)
         if result != 0:
             return buff[0]
@@ -133,12 +133,7 @@ class WinUsbPy(object):
 
     def query_interface_settings(self, index):
         if self._index != -1:
-            temp_handle_winusb = self.handle_winusb
-            if self._index != 0:
-                result = self.api.exec_function_winusb(WinUsb_GetAssociatedInterface, self.handle_winusb,
-                                                       c_ubyte(index), byref(temp_handle_winusb))
-                if result == 0:
-                    return False
+            temp_handle_winusb = self.handle_winusb[self._index]
             interface_descriptor = UsbInterfaceDescriptor()
             result = self.api.exec_function_winusb(WinUsb_QueryInterfaceSettings, temp_handle_winusb, c_ubyte(0),
                                                    byref(interface_descriptor))
@@ -149,18 +144,20 @@ class WinUsbPy(object):
         else:
             return None
 
-    def change_interface(self, index):
-        result = self.api.exec_function_winusb(WinUsb_GetAssociatedInterface, self.handle_winusb, c_ubyte(index),
-                                               byref(self.handle_winusb))
+    def change_interface(self, index, alternate=0):
+        new_handle = c_void_p()
+        result = self.api.exec_function_winusb(WinUsb_GetAssociatedInterface, self.handle_winusb[self._index], c_ubyte(alternate),
+                                               byref(new_handle))
         if result != 0:
-            self._index = index
+            self._index = index+1
+            self.handle_winusb.append(new_handle)
             return True
         else:
             return False
 
     def query_pipe(self, pipe_index):
         pipe_info = PipeInfo()
-        result = self.api.exec_function_winusb(WinUsb_QueryPipe, self.handle_winusb, c_ubyte(0), pipe_index,
+        result = self.api.exec_function_winusb(WinUsb_QueryPipe, self.handle_winusb[self._index], c_ubyte(0), pipe_index,
                                                byref(pipe_info))
         if result != 0:
             return pipe_info
@@ -179,21 +176,22 @@ class WinUsbPy(object):
             buff = c_ubyte()
             buffer_length = 0
 
-        result = self.api.exec_function_winusb(WinUsb_ControlTransfer, self.handle_winusb, setup_packet, byref(buff),
+        result = self.api.exec_function_winusb(WinUsb_ControlTransfer, self.handle_winusb[0], setup_packet, byref(buff),
                                                c_ulong(buffer_length), byref(c_ulong(0)), None)
         return {"result": result != 0, "buffer": [buff]}
 
     def write(self, pipe_id, write_buffer):
         write_buffer = create_string_buffer(write_buffer)
-        return self.api.exec_function_winusb(WinUsb_WritePipe, self.handle_winusb, c_ubyte(pipe_id), write_buffer,
+        return self.api.exec_function_winusb(WinUsb_WritePipe, self.handle_winusb[self._index], c_ubyte(pipe_id), write_buffer,
                                              c_ulong(len(write_buffer) - 1), byref(c_ulong(0)), None)
 
     def read(self, pipe_id, length_buffer):
         read_buffer = create_string_buffer(length_buffer)
-        result = self.api.exec_function_winusb(WinUsb_ReadPipe, self.handle_winusb, c_ubyte(pipe_id), read_buffer,
-                                               c_ulong(length_buffer), byref(c_ulong(0)), None)
+        len = c_ulong(0)
+        result = self.api.exec_function_winusb(WinUsb_ReadPipe, self.handle_winusb[self._index], c_ubyte(pipe_id), read_buffer,
+                                               c_ulong(length_buffer), byref(len), None)
         if result != 0:
-            return read_buffer
+            return read_buffer[:len.value]
         else:
             return None
 
@@ -203,8 +201,8 @@ class WinUsbPy(object):
         self.olread_ol.Offset = 0
         self.olread_ol.OffsetHigh = 0
         self.olread_ol.Pointer = 0
-        self.olread_ol.hEvent = 0                
-        result = self.api.exec_function_winusb(WinUsb_ReadPipe, self.handle_winusb, c_ubyte(pipe_id), self.olread_buf, 
+        self.olread_ol.hEvent = 0
+        result = self.api.exec_function_winusb(WinUsb_ReadPipe, self.handle_winusb[self._index], c_ubyte(pipe_id), self.olread_buf,
                                                c_ulong(self.olread_buflen), byref(c_ulong(0)), byref(self.olread_ol))
         if result != 0:
             return True
@@ -220,7 +218,7 @@ class WinUsbPy(object):
     def overlapped_read(self, pipe_id):
         """ keep on reading overlapped, return bytearray, empty if nothing to read, None if err"""
         rl = c_ulong(0)
-        result = self.api.exec_function_winusb(WinUsb_GetOverlappedResult, self.handle_winusb, byref(self.olread_ol),byref(rl),False)
+        result = self.api.exec_function_winusb(WinUsb_GetOverlappedResult, self.handle_winusb[self._index], byref(self.olread_ol),byref(rl),False)
         if result == 0:
             if self.get_last_error_code() == ERROR_IO_PENDING or \
                self.get_last_error_code() == ERROR_IO_INCOMPLETE:
